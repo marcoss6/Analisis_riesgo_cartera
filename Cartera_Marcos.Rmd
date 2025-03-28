@@ -1,0 +1,433 @@
+---
+title: "Cartera"
+author: "Marcos Cifuentes"
+date: "2025-03-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Cargamos las librerías necesarias para el trabajo
+
+```{r}
+library(quantmod)
+library(zoo)
+library(moments)
+library(ggplot2)
+library(psych)
+library(rugarch)
+```
+
+# OBTENCIÓN DE DATOS
+
+La lista de las empresas que conforman mi cartera va a ser: *Repsol*, *Caixabank*, *BBVA*, *Santander*, *Naturgy* <br>
+Donde Caixabank, BBVA y Santander pertenecen al sector de la banca mientras que Repsol y Naturgy al sector de energía.
+
+#### 1. Lista de los tickers, sus correspondientes pesos y la fecha deseada
+```{r}
+# Lista de los tickers
+tickers <- c("REP.MC", "CABK.MC", "BBVA.MC", "SAN.MC", "NTGY.MC")
+
+# Vector de pesos (en el mismo orden que los tickers)
+pesos <- c(0.30, 0.25, 0.20, 0.15, 0.10)
+
+# Fechas de inicio y fin 
+start_date <- as.Date("2024-01-01")
+end_date <- as.Date("2024-12-31")
+
+# Descargar los datos
+getSymbols(tickers, src = "yahoo", from = start_date, to = end_date)
+```
+
+####  2. Creamos una tabla vacía donde se irán juntando los precios de cierre
+```{r}
+precios <- NULL
+```
+
+
+####   3. Bucle para: Sacar el precio de cierre (Cl) y añadirlo a la tabla de precios
+
+```{r}
+for (ticker in tickers) {
+  cierre <- Cl(get(ticker))  # Sacar solo la columna "Close"
+  colnames(cierre) <- ticker  # Renombrar columna con el nombre del ticker
+   if (is.null(precios)) {
+    precios <- cierre  # Si es el primero, se crea la tabla
+  } else {
+    precios <- merge(precios, cierre)  # Si no, se va añadiendo (juntando por fecha)
+  }
+}
+head(precios) #Visualizar las primeras filas de los datos
+```
+# RENTABILIDADES 
+
+Cuánto sube o baja el precio de un activo en un periodo <br>
+Para ver si ganas o pierdes dinero.
+
+####   1. Bucle para calcular las rentabilidades diarias de las acciones
+
+```{r}
+# Creamos un objeto vacío para guardar rentabilidades
+rentab_xts <- NULL
+
+# Recorremos cada columna del objeto precios (que ya tiene formato xts con fechas y es lo que necesita dailyReturn)
+for (ticker in colnames(precios)) {
+  rentab <- dailyReturn(precios[, ticker], type = "log")
+  colnames(rentab) <- ticker
+  if (is.null(rentab_xts)) {
+    rentab_xts <- rentab
+  } else {
+    rentab_xts <- merge(rentab_xts, rentab)
+  }
+}
+head(rentab_xts)
+```
+
+####   2. Calcular la rentabilidad de la cartera
+
+```{r}
+# Producto matricial para calcular rentabilidad total de la cartera
+rentab_cartera <- as.numeric(rentab_xts %*% pesos)
+
+# Convertir a data.frame final con fechas
+rentab_df <- data.frame(
+  Fecha = as.Date(index(rentab_xts)),
+  coredata(rentab_xts),
+  Rentab_Cartera = rentab_cartera
+)
+head(rentab_df)
+```
+
+```{r}
+cat("La rentabilidad diaria de la cartera es", mean(rentab_df$Rentab_Cartera)*100,"%","\n")
+cat("Lo que significa que la rentabilidad anual es del", mean(rentab_df$Rentab_Cartera)*100*252,"%") # 252 días de cotización
+```
+
+# VOLATILIDADES
+
+Cuánto varía la rentabilidad (su dispersión o inestabilidad) <br>
+Para ver si la cotización del activo es más estable o inestable
+
+####   1. Volatilidad con el modelo RiskMetrics (EwMA)
+
+```{r}
+# Establecemos el parámetro lambda (valor típico en RiskMetrics)
+lambda <- 0.94
+
+# Extraemos la rentabilidad de la cartera
+rentab_cartera <- rentab_df$Rentab_Cartera
+
+# Inicializamos un vector para guardar las volatilidades
+volatility_riskmetrics <- rep(NA, length(rentab_cartera))
+
+# Asignamos la desviación estándar inicial (día 1)
+volatility_riskmetrics[1] <- sd(rentab_cartera)
+
+# Aplicamos la fórmula recursiva de RiskMetrics
+for (t in 2:length(rentab_cartera)) {
+  volatility_riskmetrics[t] <- sqrt(
+    lambda * volatility_riskmetrics[t - 1]^2 +
+      (1 - lambda) * rentab_cartera[t - 1]^2
+  )
+}
+
+head(volatility_riskmetrics)
+
+```
+
+
+#### 2. Ajuste del modelo EGARCH(1,1) y su respectiva volatilidad
+
+```{r}
+# Especificación del modelo EGARCH(1,1)
+egarch_spec <- ugarchspec(
+  variance.model = list(model = "eGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+  distribution.model = "std"  # distribución t-student
+)
+
+# Ajustar el modelo a la rentabilidad de la cartera
+fit_egarch <- ugarchfit(spec = egarch_spec, data = rentab_cartera)
+
+# Extraer la volatilidad estimada por EGARCH
+volatility_egarch <- sigma(fit_egarch)
+
+print(fit_egarch)
+```
+
+	-	El modelo ha convergido correctamente (Cuando un modelo no converge, R lo avisa o da errores)
+	-	El coeficiente beta1 ≈ 0.75 es alto → indica que la volatilidad tiene fuerte persistencia (lo que pasa hoy influye mucho en el futuro).
+	-	alpha1 ≈ -0.19 con un p-value de 0.12  → por lo que no es estadísticamente significativo al 5%. Esto indica que el modelo no presenta evidencia clara de que las rentabilidades pasadas (shocks) influyan directamente en la volatilidad de forma inmediata.
+	-	El parámetro gamma1 tiene un p-value de 0.67 → significa que no hay evidencia estadística de asimetría, es decir, responde de forma similar tanto a subidas como a bajadas del activo.
+	-	Los tests de Ljung-Box no muestran autocorrelación → el modelo ajusta bien los residuos.
+	-	Sign Bias Test: no hay sesgo en los signos → no hay evidencia de que el modelo reaccione de forma distinta a rentabilidades positivas o negativas
+	-	El Nyblom Test muestra un Joint Statistic = 0.9, menor que el valor crítico del 10% (1.49) → no hay inestabilidad en los parámetros del modelo.
+
+*Conclusión rápida:*
+
+El modelo EGARCH(1,1) ajusta correctamente a la serie de rentabilidades, captando bien la persistencia y sin mostrar inestabilidad en los parámetros ni autocorrelación en los residuos. Por tanto, es una opción adecuada para estimar la volatilidad de la cartera.
+
+
+#### Comparación
+
+Creamos un data frame que contenga ambas volatilidades
+
+```{r}
+# Creamos un data.frame para comparar
+comparison <- data.frame(
+  Periodo = 1:length(rentab_cartera),
+  Rentabilidad = rentab_cartera,
+  Volatilidad_RiskMetrics = volatility_riskmetrics,
+  Volatilidad_EGARCH = volatility_egarch
+)
+
+# Verificamos las primeras filas
+head(comparison)
+```
+
+Gráfico comparativo de las volatilidades
+
+```{r}
+xlim <- range(comparison$Periodo)
+ylim <- range(c(comparison$Volatilidad_RiskMetrics, comparison$Volatilidad_EGARCH))
+
+plot(comparison$Periodo, comparison$Volatilidad_RiskMetrics, type = "l", col = "blue", 
+     xlab = "Periodo", ylab = "Volatilidad", main = "Volatilidad diaria estimada",
+     xlim = xlim, ylim = ylim)  
+
+lines(comparison$Periodo, comparison$Volatilidad_EGARCH, col = "red")
+
+legend("topright", legend = c("RiskMetrics (EWMA)", "EGARCH"), col = c("blue", "red"), lty = 1)
+```
+
+# Valor en Riesgo (VaR)
+
+Pérdida máxima esperada en un periodo con un nivel de confianza
+
+
+#### 1. VaR No Paramétrico (Histórico)
+
+Usa los datos reales de rentabilidad de la cartera <br>
+Sin supuestos, refleja el pasado real.
+
+```{r}
+# Niveles de confianza
+niveles <- c(0.90, 0.95, 0.99)
+percentiles <- 1 - niveles  # 0.10, 0.05, 0.01
+
+# Calculamos el VaR histórico usando quantile()
+VaR_hist <- quantile(rentab_cartera, probs = percentiles)
+
+# Tabla de resultados
+VaR_hist_tabla <- data.frame(
+  Percentil = percentiles,
+  Nivel_Confianza = niveles,
+  VaR_Rentabilidad = round(as.numeric(VaR_hist), 6)
+)
+VaR_hist_tabla
+```
+
+#### 2. VaR Paramétrico (suponiendo normalidad) -> VaR Normal
+
+Usa la distribución normal (media y desviación típica de la rentabilidad de la cartera) <br>
+Supone que las rentabilidades son normales y simétricas
+
+```{r}
+# Media y desviación típica de la rentabilidad diaria
+media <- mean(rentab_cartera)
+desv <- sd(rentab_cartera)
+
+# Niveles de confianza
+niveles <- c(0.90, 0.95, 0.99)
+percentiles <- 1 - niveles  # 0.10, 0.05, 0.01
+
+# Calculamos el VaR para cada nivel
+VaR_normal <- qnorm(percentiles, mean = media, sd = desv)
+
+# Mostramos el resultado en una tabla
+VaR_normal_tabla <-data.frame(
+  Percentil = percentiles,
+  Nivel_Confianza = niveles,
+  VaR_Rentabilidad = round(VaR_normal, 6)
+)
+VaR_normal_tabla
+```
+
+
+#### 3. VaR Riskmetrics
+
+Suponemos también distribución normal centrada en la media real de la rentabilidad de la cartera.<br>
+Sin embargo, utiliza la media de las volatilidades estimadas por el modelo EWMA.
+
+```{r}
+# Media y volatilidad promedio estimada con RiskMetrics
+media <- mean(rentab_cartera)
+desv_riskmetrics <- mean(volatility_riskmetrics)
+
+# Niveles de confianza
+niveles <- c(0.90, 0.95, 0.99)
+percentiles <- 1 - niveles
+
+# VaR con RiskMetrics
+VaR_riskmetrics <- qnorm(percentiles, mean = media, sd = desv_riskmetrics)
+
+# Tabla
+VaR_riskmetrics_tabla <- data.frame(
+  Percentil = percentiles,
+  Nivel_Confianza = niveles,
+  VaR_Rentabilidad = round(VaR_riskmetrics, 6)
+)
+VaR_riskmetrics_tabla
+```
+
+#### 4. VaR EGARCH
+
+Mismo planteamiento que el VaR Normal, pero usando la media de las volatilidades estimadas por EGARCH:
+
+```{r}
+# Media de la rentabilidad diaria
+media <- mean(rentab_cartera)
+
+# Desviación típica estimada con EGARCH (media de las volatilidades)
+desv_egarch <- mean(volatility_egarch)
+
+# Niveles de confianza
+niveles <- c(0.90, 0.95, 0.99)
+percentiles <- 1 - niveles  # 0.10, 0.05, 0.01
+
+# Calculamos el VaR para cada nivel
+VaR_egarch <- qnorm(percentiles, mean = media, sd = desv_egarch)
+
+# Mostramos el resultado en una tabla
+VaR_egarch_tabla <- data.frame(
+  Percentil = percentiles,
+  Nivel_Confianza = niveles,
+  VaR_Rentabilidad = round(VaR_egarch, 6)
+)
+VaR_egarch_tabla
+```
+
+
+
+
+*Tabla comparativa*
+
+```{r}
+# Niveles de confianza
+niveles <- c("90%", "95%", "99%")
+
+# Construimos la tabla
+tabla_var <- data.frame(
+  Nivel_Confianza = niveles,
+  VaR_Normal = round(VaR_normal_tabla$VaR_Rentabilidad, 6),
+  VaR_Historico = round(VaR_hist_tabla$VaR_Rentabilidad, 6),
+  VaR_RiskMetrics = round(VaR_riskmetrics_tabla$VaR_Rentabilidad, 6),
+  VaR_EGARCH = round(VaR_egarch_tabla$VaR_Rentabilidad, 6)
+)
+tabla_var
+```
+
+*Gráficamente*
+
+```{r}
+library(ggplot2)
+
+# Construir la tabla de comparación
+tabla_comparacion <- data.frame(
+  Metodo = rep(c("Normal", "Histórico", "RiskMetrics", "EGARCH"), each = 3),
+  Nivel_Confianza = rep(c("90%", "95%", "99%"), times = 4),
+  Valor = c(
+    VaR_normal_tabla$VaR_Rentabilidad, VaR_hist_tabla$VaR_Rentabilidad,
+    VaR_riskmetrics_tabla$VaR_Rentabilidad, VaR_egarch_tabla$VaR_Rentabilidad
+  )
+)
+
+# Gráfico
+ggplot(tabla_comparacion, aes(x = Nivel_Confianza, y = Valor, fill = Metodo)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Comparación del VaR por Método", y = "VaR (rentabilidad)", x = "Nivel de confianza") +
+  theme_minimal()
+```
+
+*Conclusiones*
+
+- Todos los VaR son negativos, como es lógico, ya que representan pérdidas potenciales.
+- A medida que aumenta el nivel de confianza (de 90% a 99%), el VaR se hace más negativo, es decir, mayor pérdida esperada. Esto es esperable porque cuanto mayor es la confianza, más extremo es el escenario que se cubre.
+- VaR Histórico es el método que presenta las pérdidas más grandes, especialmente en el 99%. Esto se debe a que refleja fielmente los peores casos reales observados en los datos.
+- EGARCH es el segundo método más conservador, ya que tiene en cuenta la volatilidad variable y asimetría. 
+- RiskMetrics (EWMA) y Normal tienden a dar valores más moderados y similares entre ellos. Ambos suavizan el impacto de valores extremos.
+
+
+# BACKTESTING 
+
+```{r}
+# Nivel de confianza 95%
+alpha_bt <- 0.05
+
+# Extraemos los VaR 
+VaR_normal_bt <- tabla_var$VaR_Normal[2]
+VaR_hist_bt <- tabla_var$VaR_Historico[2]
+VaR_risk_bt <- tabla_var$VaR_RiskMetrics[2]
+VaR_egarch_bt <- tabla_var$VaR_EGARCH[2]
+
+# Función de Backtesting
+backtest_VaR <- function(rentabilidades, VaR, alpha) {
+  excedencias <- rentabilidades < VaR
+  n_excedencias <- sum(excedencias, na.rm = TRUE)
+  porcentaje_excedencias <- n_excedencias / length(rentabilidades[!is.na(rentabilidades)]) * 100
+  esperado <- length(rentabilidades[!is.na(rentabilidades)]) * alpha
+
+  list(
+    n_excedencias = n_excedencias,
+    porcentaje_excedencias = porcentaje_excedencias,
+    esperado = esperado,
+    excedencias = excedencias
+  )
+}
+```
+
+
+```{r}
+# Aplicar el backtesting
+bt_normal_cartera <- backtest_VaR(rentab_cartera, VaR_normal_bt, alpha_bt)
+bt_hist_cartera <- backtest_VaR(rentab_cartera, VaR_hist_bt, alpha_bt)
+bt_risk_cartera <- backtest_VaR(rentab_cartera, VaR_risk_bt, alpha_bt)
+bt_egarch_cartera <- backtest_VaR(rentab_cartera, VaR_egarch_bt, alpha_bt)
+
+# Mostrar resultados
+cat("Backtesting de VaR (nivel 95%):\n")
+cat(sprintf("VaR Normal:      Excedencias: %d (%.2f%%) | Esperado: %.2f\n",
+            bt_normal_cartera$n_excedencias, bt_normal_cartera$porcentaje_excedencias, bt_normal_cartera$esperado))
+cat(sprintf("VaR Histórico:   Excedencias: %d (%.2f%%) | Esperado: %.2f\n",
+            bt_hist_cartera$n_excedencias, bt_hist_cartera$porcentaje_excedencias, bt_hist_cartera$esperado))
+cat(sprintf("VaR RiskMetrics: Excedencias: %d (%.2f%%) | Esperado: %.2f\n",
+            bt_risk_cartera$n_excedencias, bt_risk_cartera$porcentaje_excedencias, bt_risk_cartera$esperado))
+cat(sprintf("VaR EGARCH:      Excedencias: %d (%.2f%%) | Esperado: %.2f\n",
+            bt_egarch_cartera$n_excedencias, bt_egarch_cartera$porcentaje_excedencias, bt_egarch_cartera$esperado))
+```
+- Excedencias observadas: Número de días en los que se perdía más de lo estimado por el VaR
+- % observado: Porcentaje de días con pérdidas superiores al VaR. Debería acercarse al nivel alpha.
+- Excedencias esperadas: Número de días que, estadísticamente, se esperaría que se superara el VaR (alpha*días).
+
+
+```{r}
+# Visualización
+plot(rentab_cartera, type = "l", col = "darkgrey", main = "Backtesting de VaR (95%)",
+     ylab = "Rentabilidad", xlab = "Días")
+abline(h = c(VaR_normal_bt, VaR_hist_bt, VaR_risk_bt, VaR_egarch_bt),
+       col = c("blue", "orange", "purple", "green"), lwd = 2, lty = 2)
+points(which(bt_normal_cartera$excedencias), rentab_cartera[bt_normal_cartera$excedencias], col = "blue",   pch = 1, lwd = 2)
+points(which(bt_hist_cartera$excedencias),   rentab_cartera[bt_hist_cartera$excedencias],   col = "orange", pch = 2, lwd = 2)
+points(which(bt_risk_cartera$excedencias),   rentab_cartera[bt_risk_cartera$excedencias],   col = "purple", pch = 0, lwd = 2)
+points(which(bt_egarch_cartera$excedencias), rentab_cartera[bt_egarch_cartera$excedencias], col = "green",  pch = 19)
+legend("bottomleft", legend = c("Normal", "Histórico", "RiskMetrics", "EGARCH"),
+       col = c("blue", "orange", "purple", "green"), pch = 19, bty = "n")
+
+```
+
+Este bloque de código realiza el backtesting del VaR al 95% para los cuatro métodos (Normal, Histórico, RiskMetrics y EGARCH).
+Calcula cuántos días se superó el riesgo estimado (excedencias), lo compara con lo esperado, y lo visualiza en una gráfica.
+Los puntos sobre la gráfica marcan los días en que la pérdida fue mayor que el VaR estimado.
+
